@@ -1,0 +1,23 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# 凭据和注册状态 (绝不能进 git)
+.env
+email-list.txt
+email-pool-state.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# 协议参考文件 (不公开)
+"HeroSMS API 协议.yaml"

@@ -1,0 +1,13 @@
+[project]
+name = "codex-reg"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "curl-cffi>=0.15.0",
+    "drissionpage>=4.1.1.4",
+    "httpcore[socks]>=1.0.9",
+    "httpx>=0.28.1",
+    "python-dotenv>=1.2.2",
+]
