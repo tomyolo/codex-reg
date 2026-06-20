@@ -304,7 +304,8 @@ def wait_for_add_phone_then_verify(
     的 input, 最后 click submit 两次 (跟原注册流一致).
 
     返回最终填入的 SMS code (调试用), timeout 抛 OAuthError.
-    country: 传给 sms.get_number (默认 USA). 美国号拿到后自动剥掉前导 1.
+    country: 传给 sms.get_number (调用方指定, 1=USA, 78=法国 等).
+    美国号拿到后自动剥掉前导 1; 其他国家原样返回.
     on_add_url: 可选 callback, URL 变成 add-phone 那一刻调用一次.
     """
     import time as _time  # 局部 import, 不污染模块顶部
@@ -327,8 +328,13 @@ def wait_for_add_phone_then_verify(
             pass
 
     act = sms.get_number(service=OPENAI_ID, country=country)
-    local = act.phone_local  # 美国自动剥前导 1
-    tab.ele('x://input[@placeholder="电话号码"]').input(local)
+    local = act.phone_local  # 美国自动剥前导 1; 法国自动加 +33
+    # 国际号 (+33...) 比纯本地号长, 默认 placeholder 是空, 但 OpenAI add-phone
+    # 在某些情况下会预填样例号 (e.g. "+1 555-..."), 必须先 clear 再 input,
+    # 否则会把示例号和真号拼一起提交.
+    phone_ele = tab.ele('x://input[@placeholder="电话号码"]')
+    phone_ele.clear()
+    phone_ele.input(local)
     tab.ele('x://button[@type="submit"]').click()
 
     code = sms.wait_for_code(

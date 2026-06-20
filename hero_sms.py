@@ -26,6 +26,7 @@ API_V1_BASE = "https://hero-sms.com/api/v1"
 SA_BASE = "https://hero-sms.com/stubs/handler_api.php"
 
 USA_ID = 187
+FRA_ID = 78  # SMS-Activate 法国 ID
 OPENAI_ID = "dr"
 
 _STATUS_OK_RE = re.compile(r"^STATUS_OK:(?P<code>\d+)$")
@@ -53,11 +54,26 @@ class Activation:
 
     @property
     def phone_local(self) -> str:
-        """OpenAI add-phone 表单期望的纯本地号 (美国 10 位, 去掉 +1)。
-        其他国家默认原样返回 (例如中国 11 位, 英国 10 位, 不动)。"""
+        """OpenAI add-phone 表单期望的号。
+
+        美国 (country=1): 11 位带前导 1 -> 剥掉, 返 10 位本地号.
+        法国 (country=78): HeroSMS 返回多种格式 (例 "+33 6 12 34 56 78",
+        "33612345678", "0612345678", "6123456789"), 统一规整成
+        "+33XXXXXXXXX" (国际格式, 带 +33, 无前导 0, 无空格).
+        其他国家: 原样返回.
+        """
         if self.country_code == 1 and self.phone_number.startswith("1") \
                 and len(self.phone_number) == 11:
             return self.phone_number[1:]
+        if self.country_code == 78:  # 法国
+            digits = self.phone_number.replace(" ", "").replace("+", "")
+            if digits.startswith("33") and len(digits) == 11:
+                digits = digits[2:]  # 去国号
+            if digits.startswith("0") and len(digits) == 10:
+                digits = digits[1:]  # 去前导 0
+            if len(digits) == 9 and digits[0] in "67":
+                return f"+33{digits}"  # 9 位本地号 + +33
+            return self.phone_number  # 格式不识别, 原样返回
         return self.phone_number
 
     @classmethod
@@ -227,7 +243,12 @@ class HeroSMS:
                         cancelled = True
                     except HeroSMSError as e:
                         msg += f"; auto-cancel failed: {e}"
-                raise HeroSMSError(msg, info={"auto_cancelled": cancelled})
+                raise HeroSMSError(
+                    msg,
+                    title="SMS_TIMEOUT",
+                    info={"auto_cancelled": cancelled,
+                          "activation_id": activation_id},
+                )
             time.sleep(poll_interval)
 
     def set_status(self, activation_id: int, status: int) -> str:

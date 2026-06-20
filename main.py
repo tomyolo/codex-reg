@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 from DrissionPage import Chromium, ChromiumOptions
 
 from outlook import EmailError, OutlookClient
-from hero_sms import HeroSMS, HeroSMSError, OPENAI_ID, USA_ID
+from hero_sms import HeroSMS, HeroSMSError, OPENAI_ID, FRA_ID
 from oauth import OAuthError, run_pkce_flow, run_pkce_flow_with_phone
 from sub2api import Sub2APIClient, Sub2APIError
 from email_pool import (
@@ -24,6 +24,9 @@ load_dotenv(Path(__file__).with_name(".env"))
 
 EMAIL_TIMEOUT = 180.0
 SMS_TIMEOUT = 180.0
+# SMS 收不到时的最大尝试次数. 每次失败: 退号 (hero_sms 内部 cancel) +
+# 重跑 OAuth (不重跑 step 1-3, 邮箱已验证), 共 N 次机会.
+SMS_MAX_ATTEMPTS = 3
 
 # 注册流页面切换的 settle 时间. 默认 1.5s 够 chatgpt/animate 进, 太短会
 # 出现"input 还没渲染就判不存在→跳过"的假阴性; 太长又拖慢批量.
@@ -118,11 +121,43 @@ def _register_one(tab, sms: HeroSMS, account: EmailAccount) -> bool:
         # 的入口是 OAuth authorize URL: 点 sub2api import 那一下浏览器会跳到
         # auth.openai.com/authorize → 自动重定向到 add-phone → 拿号 → 短信
         # → Allow → callback. 这一步交给 oauth.run_pkce_flow_with_phone 全权处理.
+        #
+        # 重试策略: SMS 收不到是 HeroSMS 平台常事 (号被占/已发过/被拒). 一次
+        # 失败就整单放弃太亏, 最多重试 SMS_MAX_ATTEMPTS 次, 每次都:
+        #   1) 让 hero_sms 把当前号 cancel (退钱, 已内置)
+        #   2) 把浏览器拉回 chatgpt.com 让 Cloudflare / OAuth callback server
+        #      状态机重置, 避免和上一轮的 port / cookie 残留打架
+        #   3) 重跑整个 step 4 (新 OAuth URL + 新号 + 新 SMS)
+        # 非 SMS 失败 (OAuth / add-phone / 浏览器) 不在重试范围 — 那些原因
+        # 跟"换号"无关, 重试也没用, 直接抛给上层.
         sleep(20)
-        _step(email, 4, TOTAL,
-              "OAuth: authorize → add-phone → 拿号 → 短信 → callback")
-        tokens = run_pkce_flow_with_phone(tab=tab, sms=sms,
-                                          country=USA_ID, timeout=180.0)
+        last_sms_err: HeroSMSError | None = None
+        for attempt in range(1, SMS_MAX_ATTEMPTS + 1):
+            _step(email, 4, TOTAL,
+                  f"OAuth + SMS (attempt {attempt}/{SMS_MAX_ATTEMPTS})")
+            try:
+                tokens = run_pkce_flow_with_phone(
+                    tab=tab, sms=sms, country=FRA_ID, timeout=180.0)
+                break
+            except HeroSMSError as e:
+                last_sms_err = e
+                cancelled = (e.info or {}).get("auto_cancelled", False)
+                print(f"[RETRY step=4] [{email}] attempt {attempt} 短信失败"
+                      f" (auto_cancelled={cancelled}): {e}",
+                      file=sys.stderr, flush=True)
+                if attempt >= SMS_MAX_ATTEMPTS:
+                    print(f"[FAIL step=4] [{email}] SMS 收不到, "
+                          f"已重试 {SMS_MAX_ATTEMPTS} 次",
+                          file=sys.stderr, flush=True)
+                    raise
+                # 重跑前让浏览器离开当前页 — 上一次可能停在 add-phone /
+                # Cloudflare / callback, 直接重 OAuth 会跟残留状态打架.
+                # 短暂 settle 防止页面跳转中又点新按钮.
+                try:
+                    tab.get("https://chatgpt.com")
+                except Exception:  # noqa: BLE001
+                    pass
+                time.sleep(2.0)
         print(f"[OK   step=4] [{email}] access={tokens.access_token[:20]}..."
               f" refresh={'y' if tokens.refresh_token else 'n'}"
               f" id_token={'y' if tokens.id_token else 'n'}", flush=True)
@@ -190,15 +225,8 @@ def main() -> int:
         todo = todo[:args.limit]
         print(f"--limit {args.limit}: 实际跑 {len(todo)} 个")
 
-    opts = ChromiumOptions()
-    # 隐身模式: 每账号独立 session, 上一个的 chatgpt/Cloudflare cookie 不残留
-    opts.set_argument("--incognito")
-    # 默认有头方便观察; HEADLESS=1 时无头 (CI / 后台跑)
-    if os.environ.get("HEADLESS") == "1":
-        opts.set_argument("--headless=new")
-    browser = Chromium(opts)
+    browser = _new_browser()
     try:
-        tab = browser.latest_tab
         sms = HeroSMS(sms_key)
         try:
             for i, account in enumerate(todo, 1):
@@ -208,7 +236,7 @@ def main() -> int:
                 reason = ""
                 ok = False
                 try:
-                    ok = _register_one(tab, sms, account)
+                    ok = _register_one(browser.latest_tab, sms, account)
                 except EmailError as e:
                     reason = f"email: {e}"[:200]
                     print(f"[{account.email}] 邮箱验证码失败: {e}",
@@ -226,6 +254,16 @@ def main() -> int:
                 verdict = "✅ OK  " if ok else "❌ FAIL"
                 print(f"\n>>> {verdict} [{account.email}] {reason}\n",
                       flush=True)
+                # 每跑完一单 (成功/失败都一样) 重建浏览器: 关掉旧进程
+                # 清掉所有 cookie / Cloudflare 验证 / OAuth callback server
+                # 等残留状态, 防止污染下一单. 重建失败也继续 — 单点故障
+                # 不应拖死整批.
+                try:
+                    browser.quit()
+                except Exception:  # noqa: BLE001
+                    pass
+                if i < len(todo):
+                    browser = _new_browser()
             return 0
         finally:
             sms.close()
@@ -234,6 +272,15 @@ def main() -> int:
             browser.quit()
         except Exception:  # noqa: BLE001
             pass
+
+
+def _new_browser() -> Chromium:
+    """起一个全新的隐身 Chromium 实例. 失败抛 (上层会按意外错误记 fail)."""
+    opts = ChromiumOptions()
+    opts.set_argument("--incognito")
+    if os.environ.get("HEADLESS") == "1":
+        opts.set_argument("--headless=new")
+    return Chromium(opts)
 
 
 if __name__ == "__main__":

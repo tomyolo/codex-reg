@@ -20,4 +20,5 @@ email-pool-state.json
 *.swp
 
 # 协议参考文件 (不公开)
+HeroSMS*协议.yaml
 "HeroSMS API 协议.yaml"
