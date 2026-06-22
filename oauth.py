@@ -244,58 +244,12 @@ class CallbackServer:
         return code
 
 
-# ---------- 自动点 Allow ----------
-
-_CONSENT_BTN_XPATHS = (
-    # 1) 注册完跳过来 → "Select existing session" 选刚注册的那个账号
-    'x://button[@data-dd-action-name="Select existing session"]',
-    # 2) 中间页 "Continue / 继续 / 下一步"
-    'x://button[contains(., "Continue")]',
-    'x://button[contains(., "继续")]',
-    # 3) Cloudflare Turnstile "Verify you are human" 复选框
-    'x://input[@type="checkbox" and contains(@class, "cb-lb")]',
-    # 4) 真正点 Allow / 授权 / Confirm 的最终 submit
-    'x://button[@type="submit"]',
-    'x://button[@data-testid="allow"]',
-    'x://button[contains(text(), "Allow")]',
-    'x://button[contains(text(), "授权")]',
-)
-
-
-def _try_click_consent(tab) -> bool:
-    """在当前 tab 上找一次 Allow/Continue/Cloudflare 检查, 找到就点。
-    多个 selector 中任一命中即视为成功, 返回 True; 一个都没找到返回 False。"""
-    for xp in _CONSENT_BTN_XPATHS:
-        try:
-            ele = tab.ele(xp, timeout=0.3)
-        except Exception:  # noqa: BLE001
-            continue
-        if ele is None:
-            continue
-        try:
-            ele.click()
-            return True
-        except Exception:  # noqa: BLE001
-            continue
-    return False
-
-
-def _auto_click_loop(tab, *, stop: threading.Event, interval: float = 0.6) -> None:
-    """后台线程: 轮询点击 Allow, 直到 stop.set() 或 callback 触发后浏览器跳走。"""
-    while not stop.is_set():
-        try:
-            _try_click_consent(tab)
-        except Exception:  # noqa: BLE001
-            pass
-        stop.wait(interval)
-
-
 # ---------- 顶层便捷函数 ----------
 
 def wait_for_add_phone_then_verify(
     tab, sms, *, timeout: float = 180.0,
     country: int = 1, on_add_url=None,
-) -> str | None:
+) -> tuple[str | None, str | None]:
     """阻塞等到浏览器跳到 add-phone, 拿号 + 输入 + 等短信 + submit。
 
     设计: 由调用方 (main.py) 在 OAuth 流程发起前调用. 浏览器停在 chatgpt.com
@@ -303,7 +257,7 @@ def wait_for_add_phone_then_verify(
     "电话号码" 的 input, 然后等 SMS 接码并填入 autocomplete="one-time-code"
     的 input, 最后 click submit 两次 (跟原注册流一致).
 
-    返回最终填入的 SMS code (调试用), timeout 抛 OAuthError.
+    返回 (phone_local, sms_code) 给调用方打日志; timeout 抛 OAuthError.
     country: 传给 sms.get_number (调用方指定, 1=USA, 78=法国 等).
     美国号拿到后自动剥掉前导 1; 其他国家原样返回.
     on_add_url: 可选 callback, URL 变成 add-phone 那一刻调用一次.
@@ -335,6 +289,40 @@ def wait_for_add_phone_then_verify(
     phone_ele = tab.ele('x://input[@placeholder="电话号码"]')
     phone_ele.clear()
     phone_ele.input(local)
+
+    # ---- 选验证方式: 短信 (不是语音) ----
+    # OpenAI 提交手机号后让用户在"短信 / 语音"里二选一. 短信这条
+    # 是个 <label> 包着 <input type="radio"> + 文本. DOM 可能调整,
+    # 用 DrissionPage 的 tag + @@text() 匹配方式比 XPath 简洁且
+    # 会查后代所有文本.
+    #
+    # 点击策略 (按 DrissionPage 文档推荐):
+    #   1) 优先点 label — 浏览器原生 label-input 关联, 自动 toggle
+    #      内层 radio, 不受 input 是否 CSS 隐藏影响.
+    #   2) fallback 用 .check(by_js=True) — DrissionPage 专给 radio
+    #      /checkbox 的方法, 内部走 JS 设 checked + 派发 change 事件,
+    #      对隐藏 input 也生效 ("只要元素在 DOM 内就能点击得到").
+    radio_sms = None
+    radio_deadline = _time.monotonic() + 5
+    while _time.monotonic() < radio_deadline:
+        # 策略 1: 直接点含"短信"的 label
+        label = tab.ele('tag:label@@text():短信', timeout=0.5)
+        if label is not None:
+            label.click()
+            radio_sms = label
+            break
+        # 策略 2: 找 radio 用 .check(by_js=True)
+        radio = tab.ele(
+            'xpath://input[@type="radio" and '
+            'ancestor::*[contains(., "短信")]]',
+            timeout=0.5,
+        )
+        if radio is not None:
+            radio.check(by_js=True)
+            radio_sms = radio
+            break
+        _time.sleep(0.3)
+
     tab.ele('x://button[@type="submit"]').click()
 
     code = sms.wait_for_code(
@@ -348,79 +336,126 @@ def wait_for_add_phone_then_verify(
         sms.finish(act.activation_id)
     except Exception:  # noqa: BLE001
         pass
-    return code
+    return local, code
+
+
+def _click_existing_session_button(tab) -> None:
+    """如果 OAuth 账号选择页 ("Select existing session") 出现, 帮点一下。
+
+    浏览器已登录过 ChatGPT 时, authorize 流程会插一个"选哪个账号继续"
+    的中间页. 这个按钮跟 submit 不同, 没有状态依赖 — 出现就点, 不会跟
+    SMS 等待/表单提交打架, 所以可以直接放在主循环里, 不用后台线程.
+    不存在/查找/点击失败都静默吞掉 — 主流程有更稳的兜底 (callback 收不到会超时).
+    """
+    try:
+        btn = tab.ele(
+            'x://button[@data-dd-action-name="Select existing session"]',
+            timeout=0.1,
+        )
+    except Exception:  # noqa: BLE001
+        return
+    if btn is not None:
+        try:
+            btn.click()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _click_post_registration_submit(tab) -> None:
+    """扫一下"提交/继续/下一步"风格的按钮, 找到就点一下, 然后返回.
+
+    用在 OAuth 流程的轮询循环里:
+      - run_pkce_flow_with_phone: 输完手机号/SMS 验证码/点了 add-phone 表单
+        submit 之后, 浏览器跳到中间过渡页 (Continue / 下一步 / 提交 等),
+        这时再点一下才能让浏览器最终到达 callback.
+      - run_pkce_flow: 同样的中间页, 只是没有 add-phone 那段.
+
+    跟 _auto_click_loop 时代的"submit 后台 clicker"是不同问题: 那个是
+    在 SMS 等待时反复命中 submit 干扰表单; 这个是单次调用放进主循环
+    显式扫, 跟 _click_existing_session_button 同一拍, 不会跟 SMS 流程
+    打架. 找不到/点击失败都静默吞掉 — 这一拍是给"刚好有按钮就点"用,
+    没有是正常的, callback 没收到会由 srv.wait_code 超时兜底.
+    """
+    for xp in (
+        'x://button[@type="submit"]',
+        'x://button[contains(., "Continue")]',
+        'x://button[contains(., "继续")]',
+        'x://button[contains(., "下一步")]',
+    ):
+        try:
+            ele = tab.ele(xp, timeout=0.5)
+        except Exception:  # noqa: BLE001
+            continue
+        if ele is None:
+            continue
+        try:
+            ele.click()
+            return
+        except Exception:  # noqa: BLE001
+            continue
 
 
 def run_pkce_flow_with_phone(
     tab, sms, *, country: int = 1, timeout: float = 180.0,
-) -> OAuthTokens:
+) -> tuple[OAuthTokens, str | None, str | None]:
     """在已登录的浏览器里跑完整 OAuth 流程 (含手机验证中间页)。
 
     设计: 调用方需保证浏览器已是 chatgpt.com 登录态 (注册流程已走完).
     流程:
       1) 构造 PKCE 一次性 verifier/challenge/state
-      2) 起本地 callback server + 后台 clicker 轮询点 Allow/Continue/Cloudflare
+      2) 起本地 callback server
       3) tab.get(authorize_url)
       4) 中途浏览器跳到 add-phone → 调用 wait_for_add_phone_then_verify
          → 拿号 → 输号 → 等短信 → submit
       5) 短信通过后浏览器自动跳到 callback → 收 code
       6) exchange code 换 token
+
+    返回 (tokens, phone_local, sms_code) — 后两者给调用方打日志, add-phone
+    这一步没走到的话会是 None.
     """
     import time as _time
-    from hero_sms import OPENAI_ID  # type: ignore
 
     verifier, challenge = _new_pkce()
     state = _new_state()
     url = build_authorize_url(state=state, code_challenge=challenge)
-    stop = threading.Event()
-    clicker = threading.Thread(
-        target=_auto_click_loop, kwargs={"tab": tab, "stop": stop},
-        daemon=True,
-    )
     code: str | None = None
     sms_code: str | None = None
+    phone_used: str | None = None
     with CallbackServer(state) as srv:
-        clicker.start()
-        try:
-            tab.get(url)
-            # ---- 等 add-phone 中间页 ----
-            deadline = _time.monotonic() + timeout
-            seen_add_phone = False
-            while _time.monotonic() < deadline:
-                try:
-                    tab.ele('x://button[@data-dd-action-name="(Missing Session) Log in to ChatGPT"]').click()
-                except Exception: pass
-                if "add-phone" in tab.url and not seen_add_phone:
-                    seen_add_phone = True
-                    sms_code = wait_for_add_phone_then_verify(
-                        tab, sms, timeout=timeout, country=country,
-                    )
-                    deadline = _time.monotonic() + timeout
-                if srv._holder.get("code") or srv._holder.get("error"):
-                    break
-                _time.sleep(0.3)
-            else:
-                if not seen_add_phone:
-                    raise OAuthError(
-                        f"OAuth 流程超时未到 add-phone 也未到 callback "
-                        f"(当前 url={tab.url!r})"
-                    )
-            code = srv.wait_code(timeout=timeout)
-        finally:
-            stop.set()
-            clicker.join(timeout=2)
+        tab.get(url)
+        # ---- 等 add-phone 中间页 ----
+        deadline = _time.monotonic() + timeout
+        seen_add_phone = False
+        while _time.monotonic() < deadline:
+            _click_existing_session_button(tab)
+            _click_post_registration_submit(tab)
+            if "add-phone" in tab.url and not seen_add_phone:
+                seen_add_phone = True
+                phone_used, sms_code = wait_for_add_phone_then_verify(
+                    tab, sms, timeout=timeout, country=country,
+                )
+                deadline = _time.monotonic() + timeout
+            if srv._holder.get("code") or srv._holder.get("error"):
+                break
+            _time.sleep(0.3)
+        else:
+            if not seen_add_phone:
+                raise OAuthError(
+                    f"OAuth 流程超时未到 add-phone 也未到 callback "
+                    f"(当前 url={tab.url!r})"
+                )
+        code = srv.wait_code(timeout=timeout)
     if code is None:
         raise OAuthError("OAuth 流程未拿到 code")
-    return exchange_code(code=code, code_verifier=verifier)
+    return exchange_code(code=code, code_verifier=verifier), phone_used, sms_code
 
 
 def run_pkce_flow(*, tab, timeout: float = 120.0) -> OAuthTokens:
     """在已登录的浏览器里跑完整 PKCE 流程, 返回 token。
 
     tab: DrissionPage Tab 对象, 调 .get(url) 跳到 authorize 页。
-    流程: 起本地 callback server → tab.get(authorize_url) → 后台线程轮询点击
-    Allow/Continue/Cloudflare 验证 → 浏览器跳到 127.0.0.1:1455/auth/callback →
-    server 收 code → 换 token。
+    流程: 起本地 callback server → tab.get(authorize_url) → 浏览器跳到
+    127.0.0.1:1455/auth/callback → server 收 code → 换 token。
 
     重要: 调用方需自行保证浏览器已是 chatgpt.com 登录态. 若尚未 add-phone,
     应在调用本函数之前先调 wait_for_add_phone_then_verify() 或在 OAuth 流中
@@ -429,17 +464,14 @@ def run_pkce_flow(*, tab, timeout: float = 120.0) -> OAuthTokens:
     verifier, challenge = _new_pkce()
     state = _new_state()
     url = build_authorize_url(state=state, code_challenge=challenge)
-    stop = threading.Event()
-    clicker = threading.Thread(
-        target=_auto_click_loop, kwargs={"tab": tab, "stop": stop},
-        daemon=True,
-    )
     with CallbackServer(state) as srv:
-        clicker.start()
-        try:
-            tab.get(url)
-            code = srv.wait_code(timeout=timeout)
-        finally:
-            stop.set()
-            clicker.join(timeout=2)
+        tab.get(url)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            _click_existing_session_button(tab)
+            _click_post_registration_submit(tab)
+            if srv._holder.get("code") or srv._holder.get("error"):
+                break
+            time.sleep(0.3)
+        code = srv.wait_code(timeout=timeout)
     return exchange_code(code=code, code_verifier=verifier)

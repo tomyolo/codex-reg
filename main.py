@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 from DrissionPage import Chromium, ChromiumOptions
 
 from outlook import EmailError, OutlookClient
-from hero_sms import HeroSMS, HeroSMSError, OPENAI_ID, FRA_ID
+from hero_sms import HeroSMS, HeroSMSError, OPENAI_ID, PRT_ID
 from oauth import OAuthError, run_pkce_flow, run_pkce_flow_with_phone
 from sub2api import Sub2APIClient, Sub2APIError
 from email_pool import (
@@ -23,7 +23,7 @@ from email_pool import (
 load_dotenv(Path(__file__).with_name(".env"))
 
 EMAIL_TIMEOUT = 180.0
-SMS_TIMEOUT = 180.0
+SMS_TIMEOUT = 130.0  # 2 分 10 秒
 # SMS 收不到时的最大尝试次数. 每次失败: 退号 (hero_sms 内部 cancel) +
 # 重跑 OAuth (不重跑 step 1-3, 邮箱已验证), 共 N 次机会.
 SMS_MAX_ATTEMPTS = 3
@@ -132,12 +132,14 @@ def _register_one(tab, sms: HeroSMS, account: EmailAccount) -> bool:
         # 跟"换号"无关, 重试也没用, 直接抛给上层.
         sleep(20)
         last_sms_err: HeroSMSError | None = None
+        phone_used: str | None = None
+        sms_code: str | None = None
         for attempt in range(1, SMS_MAX_ATTEMPTS + 1):
             _step(email, 4, TOTAL,
                   f"OAuth + SMS (attempt {attempt}/{SMS_MAX_ATTEMPTS})")
             try:
-                tokens = run_pkce_flow_with_phone(
-                    tab=tab, sms=sms, country=FRA_ID, timeout=180.0)
+                tokens, phone_used, sms_code = run_pkce_flow_with_phone(
+                    tab=tab, sms=sms, country=PRT_ID, timeout=130.0)
                 break
             except HeroSMSError as e:
                 last_sms_err = e
@@ -158,7 +160,9 @@ def _register_one(tab, sms: HeroSMS, account: EmailAccount) -> bool:
                 except Exception:  # noqa: BLE001
                     pass
                 time.sleep(2.0)
-        print(f"[OK   step=4] [{email}] access={tokens.access_token[:20]}..."
+        print(f"[OK   step=4] [{email}] phone={phone_used!r}"
+              f" sms_code={sms_code!r}"
+              f" access={tokens.access_token[:20]}..."
               f" refresh={'y' if tokens.refresh_token else 'n'}"
               f" id_token={'y' if tokens.id_token else 'n'}", flush=True)
     finally:

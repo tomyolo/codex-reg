@@ -27,6 +27,8 @@ SA_BASE = "https://hero-sms.com/stubs/handler_api.php"
 
 USA_ID = 187
 FRA_ID = 78  # SMS-Activate 法国 ID
+IDN_ID = 6   # SMS-Activate 印度尼西亚 ID
+PRT_ID = 117 # SMS-Activate 葡萄牙 ID
 OPENAI_ID = "dr"
 
 _STATUS_OK_RE = re.compile(r"^STATUS_OK:(?P<code>\d+)$")
@@ -60,7 +62,15 @@ class Activation:
         法国 (country=78): HeroSMS 返回多种格式 (例 "+33 6 12 34 56 78",
         "33612345678", "0612345678", "6123456789"), 统一规整成
         "+33XXXXXXXXX" (国际格式, 带 +33, 无前导 0, 无空格).
+        印度尼西亚 (country=6): 同法国, 规整成 "+62XXXXXXXXX" (印尼手机
+        以 8 开头, 例如 +6281234567890).
+        葡萄牙 (country=117): 同法国, 规整成 "+351XXXXXXXXX" (葡萄牙手机
+        以 9 开头, 例如 +351912345678).
         其他国家: 原样返回.
+
+        新增国家按法国模式处理: 先剥空格/`+`/国号/前导 0, 再按本地号位数
+        和首字符 (移动号段) 校验, 通过则拼回带 `+<cc>` 的国际格式; 不识别
+        就原样返回, 不要抛错 (HeroSMS 返回格式有波动, 不能误伤主流程).
         """
         if self.country_code == 1 and self.phone_number.startswith("1") \
                 and len(self.phone_number) == 11:
@@ -73,6 +83,22 @@ class Activation:
                 digits = digits[1:]  # 去前导 0
             if len(digits) == 9 and digits[0] in "67":
                 return f"+33{digits}"  # 9 位本地号 + +33
+            return self.phone_number  # 格式不识别, 原样返回
+        if self.country_code == 6:  # 印度尼西亚
+            digits = self.phone_number.replace(" ", "").replace("+", "")
+            if digits.startswith("62") and len(digits) >= 11:
+                digits = digits[2:]  # 去国号 62
+            if digits.startswith("0") and len(digits) >= 10:
+                digits = digits[1:]  # 去前导 0
+            if len(digits) >= 9 and digits[0] == "8":  # 印尼手机以 8 开头
+                return f"+62{digits}"
+            return self.phone_number  # 格式不识别, 原样返回
+        if self.country_code == 117:  # 葡萄牙
+            digits = self.phone_number.replace(" ", "").replace("+", "")
+            if digits.startswith("351") and len(digits) == 12:
+                digits = digits[3:]  # 去国号 351
+            if len(digits) == 9 and digits[0] == "9":  # 葡手机以 9 开头
+                return f"+351{digits}"
             return self.phone_number  # 格式不识别, 原样返回
         return self.phone_number
 
