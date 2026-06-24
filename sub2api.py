@@ -13,6 +13,7 @@ from __future__ import annotations
 import base64
 import json
 import re
+import time
 from dataclasses import dataclass
 from typing import Any, Iterable
 
@@ -27,9 +28,13 @@ COOKIE_NAMES = ("__Secure-next-auth.session-token", "next-auth.session-token")
 class Sub2APIError(Exception):
     """sub2api API 错误。"""
 
-    def __init__(self, message: str, *, status_code: int | None = None,
-                 info: dict | None = None) -> None:
+    def __init__(self, message: str, *, title: str | None = None,
+                 status_code: int | None = None, info: dict | None = None) -> None:
         super().__init__(message)
+        # title 用来区分错误大类, 跟 HeroSMSError 对齐:
+        #   None       -- 业务错 (HTTP 4xx/5xx, sub2api 业务 code != 0)
+        #   "TRANSPORT_ERROR" -- httpx 传输层错 (断连/超时), 可安全重试
+        self.title = title
         self.status_code = status_code
         self.info = info or {}
 
@@ -147,6 +152,7 @@ class Sub2APIClient:
                              id_token: str | None = None,
                              group_ids: Iterable[int] | None = None,
                              update_existing: bool = True,
+                             max_retries: int = 2,
                              ) -> ImportResult:
         """导入一个 ChatGPT 账号。
 
@@ -155,6 +161,12 @@ class Sub2APIClient:
         refresh_token -- ROPC 首次换出来的 refresh_token (可选, 但提供能自动续期)
         group_ids     -- 加入的分组 id 列表 (可选)
         update_existing -- 重复时是否更新
+        max_retries    -- 传输错 (断连/超时) 重试次数, 不含首次. 0 = 不重试.
+
+        传输错 (RemoteProtocolError / ConnectError / 超时 等) 会被 sub2api
+        包成 Sub2APIError(title="TRANSPORT_ERROR"), 并在这里自动重试
+        max_retries 次, 间隔 0.5s -> 1.5s 退避. 业务错 (HTTP 4xx/5xx)
+        不重试 — 重试也没意义, 立刻报给调用方.
         """
         if not access_token:
             raise ValueError("access_token is required")
@@ -180,17 +192,54 @@ class Sub2APIClient:
         if group_ids:
             body["group_ids"] = list(group_ids)
 
-        resp = self._post("/api/v1/admin/accounts/import/codex-session", body)
-        return self._parse_import(resp)
+        # 传输错重试, 业务错立刻抛. 不引随机退避 — 短窗口内重试相同
+        # endpoint, jitter 反而会拖慢; 固定 0.5/1.5s 够 cover Cloudflare
+        # keepalive 抖动.
+        backoffs = [0.5, 1.5, 3.0]
+        last_err: Sub2APIError | None = None
+        for attempt in range(max_retries + 1):
+            try:
+                resp = self._post("/api/v1/admin/accounts/import/codex-session", body)
+                return self._parse_import(resp)
+            except Sub2APIError as e:
+                if e.title != "TRANSPORT_ERROR":
+                    raise
+                last_err = e
+                if attempt >= max_retries:
+                    raise
+                sleep_s = backoffs[min(attempt, len(backoffs) - 1)]
+                time.sleep(sleep_s)
+        # 理论走不到这里 — 上面要么 raise 要么 return. 但 max_retries=0 时
+        # 走最后一行时 last_err 还是 None, 兜底抛一次.
+        if last_err is not None:
+            raise last_err
+        raise Sub2APIError("import_codex_session: 重试逻辑异常退出")
 
     # ---------- 内部 ----------
 
     def _get(self, path: str, **kw: Any) -> dict:
-        return self._parse(self._client.get(f"{self.base_url}{path}", **kw))
+        return self._parse(self._request("GET", path, kw or None))
 
     def _post(self, path: str, body: dict) -> dict:
-        return self._parse(
-            self._client.post(f"{self.base_url}{path}", json=body))
+        return self._parse(self._request("POST", path, {"json": body}))
+
+    def _request(self, method: str, path: str, kwargs: dict | None) -> httpx.Response:
+        """httpx 调用统一加一层, 把传输错包成 Sub2APIError(TRANSPORT_ERROR).
+
+        不动业务错 (HTTP 4xx/5xx), 让 _parse 照常抛 Sub2APIError. 这一层
+        只 catch httpx.TransportError 及其子类 — RemoteProtocolError /
+        ConnectError / *Timeout / 协议层异常都归在这里.
+        """
+        try:
+            return self._client.request(method, f"{self.base_url}{path}",
+                                        **kwargs)
+        except httpx.TransportError as e:
+            raise Sub2APIError(
+                f"sub2api transport error ({method} {path}): "
+                f"{type(e).__name__}: {e}",
+                title="TRANSPORT_ERROR",
+                info={"error": type(e).__name__, "detail": str(e)},
+            ) from e
 
     @staticmethod
     def _parse(resp: httpx.Response) -> dict:

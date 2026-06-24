@@ -28,7 +28,11 @@ SA_BASE = "https://hero-sms.com/stubs/handler_api.php"
 USA_ID = 187
 FRA_ID = 78  # SMS-Activate 法国 ID
 IDN_ID = 6   # SMS-Activate 印度尼西亚 ID
+ROM_ID = 16  # SMS-Activate 罗马尼亚 ID
 PRT_ID = 117 # SMS-Activate 葡萄牙 ID
+COL_ID = 33  # HeroSMS 哥伦比亚 ID (国号 +57, 价格 0.050, 实测 countryPhoneCode=57)
+CMR_ID = 37  # SMS-Activate 喀麦隆 ID (国号 +237, 移动号 6 开头 9 位)
+PHL_ID = 4   # SMS-Activate 菲律宾 ID (国号 +63, 移动号 9 开头 10 位)
 OPENAI_ID = "dr"
 
 _STATUS_OK_RE = re.compile(r"^STATUS_OK:(?P<code>\d+)$")
@@ -58,49 +62,15 @@ class Activation:
     def phone_local(self) -> str:
         """OpenAI add-phone 表单期望的号。
 
-        美国 (country=1): 11 位带前导 1 -> 剥掉, 返 10 位本地号.
-        法国 (country=78): HeroSMS 返回多种格式 (例 "+33 6 12 34 56 78",
-        "33612345678", "0612345678", "6123456789"), 统一规整成
-        "+33XXXXXXXXX" (国际格式, 带 +33, 无前导 0, 无空格).
-        印度尼西亚 (country=6): 同法国, 规整成 "+62XXXXXXXXX" (印尼手机
-        以 8 开头, 例如 +6281234567890).
-        葡萄牙 (country=117): 同法国, 规整成 "+351XXXXXXXXX" (葡萄牙手机
-        以 9 开头, 例如 +351912345678).
-        其他国家: 原样返回.
-
-        新增国家按法国模式处理: 先剥空格/`+`/国号/前导 0, 再按本地号位数
-        和首字符 (移动号段) 校验, 通过则拼回带 `+<cc>` 的国际格式; 不识别
-        就原样返回, 不要抛错 (HeroSMS 返回格式有波动, 不能误伤主流程).
+        规整规则 (所有国家统一): 只看有没有 `+` 前缀 — 有就原样返回;
+        没有就加 `+` 再返回. 不做国号剥除 / 位数校验 / 号段判断, 因为
+        HeroSMS 返回格式波动较大, 任何深度判断都可能误伤主流程. 真正
+        要校验的是 OpenAI 表单自己 — 它会拒错号, 拒了再退号重试.
         """
-        if self.country_code == 1 and self.phone_number.startswith("1") \
-                and len(self.phone_number) == 11:
-            return self.phone_number[1:]
-        if self.country_code == 78:  # 法国
-            digits = self.phone_number.replace(" ", "").replace("+", "")
-            if digits.startswith("33") and len(digits) == 11:
-                digits = digits[2:]  # 去国号
-            if digits.startswith("0") and len(digits) == 10:
-                digits = digits[1:]  # 去前导 0
-            if len(digits) == 9 and digits[0] in "67":
-                return f"+33{digits}"  # 9 位本地号 + +33
-            return self.phone_number  # 格式不识别, 原样返回
-        if self.country_code == 6:  # 印度尼西亚
-            digits = self.phone_number.replace(" ", "").replace("+", "")
-            if digits.startswith("62") and len(digits) >= 11:
-                digits = digits[2:]  # 去国号 62
-            if digits.startswith("0") and len(digits) >= 10:
-                digits = digits[1:]  # 去前导 0
-            if len(digits) >= 9 and digits[0] == "8":  # 印尼手机以 8 开头
-                return f"+62{digits}"
-            return self.phone_number  # 格式不识别, 原样返回
-        if self.country_code == 117:  # 葡萄牙
-            digits = self.phone_number.replace(" ", "").replace("+", "")
-            if digits.startswith("351") and len(digits) == 12:
-                digits = digits[3:]  # 去国号 351
-            if len(digits) == 9 and digits[0] == "9":  # 葡手机以 9 开头
-                return f"+351{digits}"
-            return self.phone_number  # 格式不识别, 原样返回
-        return self.phone_number
+        s = self.phone_number.strip()
+        if s.startswith("+"):
+            return s
+        return f"+{s}"
 
     @classmethod
     def from_sa_response(cls, text: str) -> "Activation":

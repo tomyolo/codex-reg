@@ -20,9 +20,13 @@ import threading
 import time
 import urllib.parse
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 import httpx
+
+if TYPE_CHECKING:
+    from sms_pool import SmsPool
+
 
 # Codex CLI 用的公开 OAuth 配置 (从 codex-cli 二进制反编译, 与 chatgpt.com
 # 网页登录的 client_id 不同). redirect_uri 用 1455 跟 Codex CLI 默认一致.
@@ -247,7 +251,7 @@ class CallbackServer:
 # ---------- 顶层便捷函数 ----------
 
 def wait_for_add_phone_then_verify(
-    tab, sms, *, timeout: float = 180.0,
+    tab, pool: "SmsPool", *, timeout: float = 180.0,
     country: int = 1, on_add_url=None,
 ) -> tuple[str | None, str | None]:
     """阻塞等到浏览器跳到 add-phone, 拿号 + 输入 + 等短信 + submit。
@@ -258,7 +262,8 @@ def wait_for_add_phone_then_verify(
     的 input, 最后 click submit 两次 (跟原注册流一致).
 
     返回 (phone_local, sms_code) 给调用方打日志; timeout 抛 OAuthError.
-    country: 传给 sms.get_number (调用方指定, 1=USA, 78=法国 等).
+    pool: SmsPool 实例 — 拿号/接码/取消都走池子, 取消时 120s 冷却由池子管.
+    country: 传给 pool.get_number (调用方指定, 1=USA, 78=法国 等).
     美国号拿到后自动剥掉前导 1; 其他国家原样返回.
     on_add_url: 可选 callback, URL 变成 add-phone 那一刻调用一次.
     """
@@ -281,8 +286,8 @@ def wait_for_add_phone_then_verify(
         except Exception:  # noqa: BLE001
             pass
 
-    act = sms.get_number(service=OPENAI_ID, country=country)
-    local = act.phone_local  # 美国自动剥前导 1; 法国自动加 +33
+    act = pool.get_number(service=OPENAI_ID, country=country)
+    local = act.phone_local
     # 国际号 (+33...) 比纯本地号长, 默认 placeholder 是空, 但 OpenAI add-phone
     # 在某些情况下会预填样例号 (e.g. "+1 555-..."), 必须先 clear 再 input,
     # 否则会把示例号和真号拼一起提交.
@@ -325,17 +330,13 @@ def wait_for_add_phone_then_verify(
 
     tab.ele('x://button[@type="submit"]').click()
 
-    code = sms.wait_for_code(
-        act.activation_id, timeout=timeout, auto_cancel_on_timeout=True,
-    )
+    # get_code 内部就轮询 + 收完即从池里删; 成功时主动 cancel 退号会触发
+    # 120s 冷却 (因为刚买), 所以这里不调 cancel — 让号在 HeroSMS 上挂到
+    # 自然超时, 不浪费退号请求 (退号是失败重试时让上层显式调的事).
+    code = pool.get_code(act.activation_id, timeout=timeout)
     tab.ele('x://*[@autocomplete="one-time-code"]').input(code)
     tab.ele('x://button[@type="submit"]').click()
     tab.ele('x://button[@type="submit"]').click()
-
-    try:
-        sms.finish(act.activation_id)
-    except Exception:  # noqa: BLE001
-        pass
     return local, code
 
 
@@ -396,7 +397,7 @@ def _click_post_registration_submit(tab) -> None:
 
 
 def run_pkce_flow_with_phone(
-    tab, sms, *, country: int = 1, timeout: float = 180.0,
+    tab, pool: "SmsPool", *, country: int = 1, timeout: float = 180.0,
 ) -> tuple[OAuthTokens, str | None, str | None]:
     """在已登录的浏览器里跑完整 OAuth 流程 (含手机验证中间页)。
 
@@ -432,7 +433,7 @@ def run_pkce_flow_with_phone(
             if "add-phone" in tab.url and not seen_add_phone:
                 seen_add_phone = True
                 phone_used, sms_code = wait_for_add_phone_then_verify(
-                    tab, sms, timeout=timeout, country=country,
+                    tab, pool, timeout=timeout, country=country,
                 )
                 deadline = _time.monotonic() + timeout
             if srv._holder.get("code") or srv._holder.get("error"):
