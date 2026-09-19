@@ -61,6 +61,35 @@ _LANG_HEADERS = [
 ]
 
 
+
+def _find_browser_path() -> str | None:
+    """定位 Chromium 内核浏览器可执行文件, 优先用 Edge.
+
+    查找顺序:
+    1. 环境变量 BROWSER_PATH (用户显式指定, 最高优先级)
+    2. Windows 常见 Edge 安装路径
+    3. Windows 常见 Chrome 安装路径
+    4. 返回 None — 交给 DrissionPage 自动探测 (会下载内置 Chromium)
+    """
+    env_path = os.environ.get("BROWSER_PATH")
+    if env_path and os.path.isfile(env_path):
+        return env_path
+
+    candidates = [
+        # Edge (Windows 常见安装位置)
+        os.path.expandvars(r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe"),
+        os.path.expandvars(r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe"),
+        os.path.expandvars(r"%LocalAppData%\Microsoft\Edge\Application\msedge.exe"),
+        # Chrome (兜底)
+        os.path.expandvars(r"%ProgramFiles%\Google\Chrome\Application\chrome.exe"),
+        os.path.expandvars(r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe"),
+        os.path.expandvars(r"%LocalAppData%\Google\Chrome\Application\chrome.exe"),
+    ]
+    for p in candidates:
+        if p and os.path.isfile(p):
+            return p
+    return None
+
 def _human_input(element, text: str, *, base_delay: float = 0.07,
                  jitter: float = 0.04, max_pause: float = 0.25) -> None:
     """逐字符输入 + 抖动延迟 + 偶尔长停顿。
@@ -131,6 +160,10 @@ class Reg:
         """起一个全新的隐身 Chromium 实例, 配本单专属指纹. 失败抛."""
         ua, (vw, vh), lang = _random_fingerprint()
         opts = ChromiumOptions()
+        browser_path = _find_browser_path()
+        if browser_path:
+            opts.set_browser_path(browser_path)
+            print(f"[BROWSER] 使用浏览器: {browser_path}", flush=True)
         opts.set_argument("--incognito")
         opts.set_user_agent(ua)
         opts.set_argument(f"--window-size={vw},{vh}")
